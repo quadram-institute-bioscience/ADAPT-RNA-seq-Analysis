@@ -11,7 +11,7 @@ The processing of raw RNA-sequencing data follows the protocol by Pertea et al. 
 
 * Alignment of reads to the reference genome using HISAT2
 
-* Assembly of the alingments into full-length transcripts using StringTie
+* Assembly of the alignments into full-length transcripts using StringTie
 
 * Quantification of the expression levels using StringTie
 
@@ -32,7 +32,7 @@ The processing of raw RNA-sequencing data follows the protocol by Pertea et al. 
 
 ## Processing RNA-seq data
 
-To start the processing, move to the source code diretory (src/), and run the wrapper script:
+To start the processing, move to the source code directory (src/), and run the wrapper script:
 
 ```
 $ cd src/
@@ -43,7 +43,9 @@ $ ./rnaseq-processing.sh
 
 ## Differential Expression Analysis with DESeq2
 
-Differntial expression analysis is performed using DESeq2 (src/DE-analysis.Rmd)
+Differential expression analysis is performed using DESeq2 (src/DE-analysis.Rmd). Defaults assume that the gene counts and metadata are saved as csv files in the data directory.
+
+NOTE: RNA-seq data and processed data will be made available upon publication.
 
 
 
