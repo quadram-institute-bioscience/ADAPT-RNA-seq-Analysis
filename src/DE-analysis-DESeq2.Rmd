@@ -1,0 +1,1583 @@
+---
+title: "Differential Expression Analysis for ADaPt RNA-seq data "
+author: "Perla Rey"
+date: "2020"
+output: 
+  github_document:
+    toc: true
+    toc_depth: 4
+    fig_width: 11
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+saveFiles <- TRUE
+MetadataFile <- "../data/metadata-analysis.xlsx"
+CountsFile <- "../results/gene_counts_78samples.csv"
+DELOC <- "../results/DE-DESeq2/"
+FIGLOC <- "../results/DE-DESeq2/figures/"
+
+```
+
+
+```{r libraries, include=FALSE}
+
+# For bioconductor packages
+# DESeq2 : for differential analysis
+# AnnotationDbi : annotation
+# org.Hs.eg.db: annotation for homo sapiens
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+biocpkgs = c("limma", "edgeR", "biomaRt", "DESeq2", "geneplotter", "EnhancedVolcano", "apeglm", 
+             "AnnotationDbi","org.Hs.eg.db")
+package.check <- lapply(biocpkgs, Is.Installed.bioc <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    print(paste("Installing: ", pkg, sep = ""))
+    BiocManager::install(pkg)
+    library(pkg, character.only = TRUE)
+  }
+})
+
+# For other packages
+# readxl : to import excel files
+# magrittr: A forward-pipe operator for R
+# glmpca: Generalised PCA
+# PoiClaClu Package: for Poisson Distance
+# ggbeeswarm: Categorial Scatter (Violin Point) Plots
+otherpkgs = c("ggplot2", "RColorBrewer", "gplots", "readxl", "magrittr", "glmpca", "PoiClaClu", "ggbeeswarm", "ashr", "ggpubr")
+package.check <- lapply(otherpkgs, Is.Installed <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+})
+
+library(knitr)
+library(ggpubr)
+library(plotly)
+library(limma)
+library(dplyr)
+
+
+```
+
+Differential Expression analysis is performed using DESeq2, based on the following workflow:  <https://www.bioconductor.org/packages/devel/workflows/vignettes/rnaseqGene/inst/doc/rnaseqGene.html>.
+
+
+# ADaPt Study: RNA-seq Data 
+
+RNA-seq data for the ADaPt study contains 78 samples: 2 samples per each of the 39 volunteers. The goal of the RNA-seq experiment is to study the effect of Glucoraphanin (GRN) in the transcriptional profile of the prostate. The study Each volunteer was part of one of four interventions: GRN/Placebo, GRN/Alliin, Alliin/Placebo and Placebo/Placebo. These groups can be divided in two interventions: GRN and non-GRN. For each volunteer, there are two samples, one for the peripheral zone, and one for the transitional zone.
+
+The number of samples for each group and zone are: 
+
+
+- 10 GRN/Placebo (GRN)
+- 10 GRN/Alliin (GRN)
+- 10 Alliin/Placebo (non-GRN)
+- 9 Placebo/Placebo (non-GRN)
+
+
+This experiment follows a 2-factorial design to test for the effect of GRN and non-GRN interventions on each of two zones separately. Two boolean variables are created: TreatA (for GRN) and TreatB (for non-GRN).  
+
+The variable TreatA is set to 1 if the sample is from a GRN intervention group (GRN/Placebo or GRN/Alliin). TreatA is set to 0  if the sample is from a non-GRN intervention group (Placebo/Placebo or Alliin/Placebo).
+
+Similarly, TreatB is set to 1 if the sample is from a non-GRN intervention group (Placebo/Placebo or Alliin/Placebo). Otherwise, the value of TreatB is 0 if the sample is from a GRN intervention group (GRN/Placebo or GRN/Alliin).
+
+
+
+## Metadata
+
+```{r loadMetaData, echo=FALSE}
+metadataAll <- read_excel(MetadataFile)
+head(metadataAll)
+
+# subset for only PZ
+metadataPZ <- metadataAll[metadataAll$ZoneCode == "PZ", ]
+# subset for only TZ
+metadataTZ <- metadataAll[metadataAll$ZoneCode == "TZ", ]
+
+```
+
+Loading the gene counts table
+
+```{r loadData, echo=FALSE}
+countDataAll <- as.matrix(read.csv(CountsFile, row.names="gene_id"))
+head(countDataAll)
+
+# Check all sample IDs in countData are also in metadata and match their orders
+print("Are all the samples in the gene count table and also in the metadata?")
+all(metadataAll$Sample %in% colnames(countDataAll))
+countDataAll <- countDataAll[, metadataAll$Sample]
+print("Are the samples in the gene count table in the same order as in the metadata?")
+all(metadataAll$Sample == colnames(countDataAll))
+```
+
+
+Creating DESeq object to test the effect of GRN and Alliin in the peripheral zone, then in the transitional zone.
+
+```{r DESeqObject}
+# Creating the DESeq object for samples only in one zone at the time
+
+for (T in c("PZ","TZ")){
+  print(paste0("Samples for zone: ", T))
+  if (T=="PZ"){
+    # PZ samples
+    keep <- which(metadataAll$ZoneCode == "PZ")
+    zone <- "PZ"
+  }else{
+    # TZ Samples
+    keep <- which(metadataAll$ZoneCode == "TZ")
+    zone <- "TZ"
+  }
+  countData <- countDataAll[,keep]
+  metadata <- metadataAll[keep,]
+  metadata$Group <- as.factor(metadata$Group)
+  metadata$ZoneCode <- as.factor(metadata$ZoneCode)
+  metadata$TreatA <- as.factor(metadata$TreatA)
+  metadata$TreatB <- as.factor(metadata$TreatB)
+  
+  # To test for the effect of the Treatment
+  dds <- DESeqDataSetFromMatrix(countData = countData, colData = metadata, design = ~TreatA + TreatB )
+  
+  # To test whether there are any significan interactions using a likelihood test
+  # We will use DESeq2 with test="LRT", reduced = ~TreatA + TreatB
+  dds.M2 <- DESeqDataSetFromMatrix(countData = countData, colData = metadata, design = ~TreatA + TreatB + TreatA:TreatB )
+  
+  # check leves of TreatA and TreatB (0 - "control" - should be the first level)
+  print(levels(dds$TreatA))
+  print(levels(dds$TreatB))
+  
+  if (T=="PZ"){
+    # PZ samples
+    dds.PZ <- dds
+    dds.M2.PZ <- dds.M2
+  }else{
+    # TZ Samples
+    dds.TZ <- dds
+    dds.M2.TZ <- dds.M2
+  }
+
+  
+}
+
+
+```
+
+Creating DESeq object for only control samples, which will be used to tests differences between peripheral and transitional zone.
+
+```{r DESeqObject.AC.PZ.TZ}
+# Creating the DESeq object for only control samples (group: Placebo/Placebo) for both zones
+
+print("Control samples in both zones ")
+
+keep <- which(metadataAll$Group == "Placebo/Placebo")
+zone <- "PZ.and.TZ"
+
+countData <- countDataAll[,keep]
+metadata <- metadataAll[keep,]
+metadata$Group <- as.factor(metadata$Group)
+metadata$ZoneCode <- as.factor(metadata$ZoneCode)
+metadata$TreatA <- as.factor(metadata$TreatA)
+metadata$TreatB <- as.factor(metadata$TreatB)
+
+# To test for the effect of the Treatment 
+dds.PP <- DESeqDataSetFromMatrix(countData = countData, colData = metadata, design = ~ZoneCode )
+
+
+
+```
+
+# Exploratory Analysis
+
+## Prefiltering of the dataset
+
+**The gene expression data contains `r nrow(dds)` genes**, which includes all genes in the assembly: protein coding genes, non coding genes, etc.
+
+Typically, we could start by removing low expressed genes. It is not necessary to pre-filter low count genes before running DESeq2 functions although there are two reasons which make pre-filtering useful: by removing low counts, we reduce memory size of the dds data objet, and we increase speed of the transformation and testing functions within DESeq2. 
+
+A minimal pre-filtering to keep only genes with at least 10 counts in at least the number of samples in the smallest group: in this case we keep all genes with at least 10 counts in >= 19 samples. 
+The more strict filtering to increase power is automatically applied via independent filtering on the mean of normalised counts within the results function.
+
+
+Here we apply a filter and keep only genes with a minimum of 10 counts for at least 19 samples.
+
+
+```{r prefiltering}
+
+# Create folder for results
+dir.create(DELOC, showWarnings = FALSE)
+dir.create(FIGLOC, showWarnings = FALSE)
+
+th <- 10
+ns <- 19
+threshold <- "prefiltering"
+NumGenes <- integer(2)
+LowExp <- integer(2)
+Expressed <- integer(2)
+
+for (T in c("PZ", "TZ")){
+  
+  if (T=="PZ"){
+    dds <- dds.PZ
+    dds.M2 <- dds.M2.PZ
+    NumGenes[1] <- nrow(counts(dds))
+    Expressed[1] <- sum(rowSums(counts(dds) > th) >= ns)
+    LowExp[1] <- nrow(counts(dds)) - sum(rowSums(counts(dds) > th) >= ns)
+  }else{
+    dds <- dds.TZ
+    dds.M2 <- dds.M2.TZ
+    NumGenes[2] <- nrow(counts(dds))
+    Expressed[2] <- sum(rowSums(counts(dds) > th) >= ns)
+    LowExp[2] <- nrow(counts(dds))- sum(rowSums(counts(dds) > th) >= ns)
+  }
+  
+  # Each individual group: TreatA=1, TreatA=0, TreatB=1, TreatB=0, has at least 19 samples 
+  keep <- rowSums(counts(dds) > th) >= ns # keep genes with at least ns samples with a count of th or higher
+  dds <- dds[keep,]
+  nrow(dds)
+  
+  keep <- rowSums(counts(dds.M2) > th) >= ns # keep genes with at least ns samples with a count of th or higher
+  dds.M2 <- dds.M2[keep,]
+  nrow(dds.M2)
+  
+  if (T=="PZ"){
+    dds.PZ <- dds
+    dds.M2.PZ <- dds.M2
+  }else{
+    dds.TZ <- dds
+    dds.M2.TZ <- dds.M2
+  }
+  
+}
+```
+
+Summary from the pre-filtering of lowly expressed genes: 
+
+```{r prefilt.table, echo=FALSE}
+T <- data.frame( Zone = c("PZ", "TZ"),
+                 NumGenes = NumGenes,
+                 LowExpressed = LowExp,
+                 Expressed = Expressed)
+kable(T)
+```
+
+The column "Expressed" in the above table, represents the number of genes that will be used for downstream analysis, for each of the zones.
+
+
+## The variance stabilising transformation and the rlog
+
+Methods for exploratory analysis of multidimensional data (clustering, PCA) work best for data that generally has the same range of variance at different ranges of the mean values (homoskedastic)
+
+DESeq2 provides two transformations: the Variance Stabilizing Transformation (VST) and rlog. 
+
+It is recommended to use VST for medium to large datasets (n>30).
+VST is much faster to compute than rlog and is less sensitive to high count outliers than the rlog. 
+
+The two transformations offered by DESeq2 are provided for applications other than differential testing. For differential testing it is recommended to use the DESeq function to raw counts, which also takes into account the dependence of the variance of counts on the mean value during the dispersion estimation step.
+
+
+Perform VST on data from each of the zones separately and for control samples.
+
+```{r vst}
+# For each zone (PZ, TZ) and for control samples
+
+# Variance Stabilizing Transformation (VST)
+# If blind = FALSE, the differences between the variables in the design will not contribute to the expected variance-mean trend of the experiment. The experimental design is not used directly in the transformation, only in estimating the global amount of variability in the counts. 
+# For a fully unsupervised transformation, one can set blind = TRUE
+
+for (T in c("PZ", "TZ", "Control")){
+  if (T == "PZ"){
+    # use a generic variable called dds
+    dds <- dds.PZ
+  }
+  if (T == "TZ"){
+    # use a generic variable called dds
+    dds <- dds.TZ
+  }
+  if (T == "Control"){
+    dds <- dds.PP
+  }
+  
+  # Transformation
+  vsd <- vst(dds, blind = TRUE)
+  head(assay(vsd))[1:4,1:8]  # show only the first 4 rows, and first 8 columns
+  colData(vsd)
+  
+  # update the corresponding vsd varaible for each of the zones
+  if (T == "PZ"){
+    vsd.PZ <- vsd
+  }
+  if (T == "TZ"){
+    vsd.TZ <- vsd
+  }
+  if (T == "Control"){
+    vsd.PP <- vsd
+  }
+}
+
+```
+
+
+## Sample Distances 
+
+A useful first step in an RNA-seq analysis is often to assess overall similarity between samples: does this fit the expectation from the experiment's design?
+
+
+The following uses the Euclidean distance between samples, on the vst data: 
+
+```{r distances.vst}
+
+for (T in c("PZ", "TZ")){
+  if (T=="PZ"){
+    vsd <- vsd.PZ
+  }
+  if (T=="TZ"){
+    vsd <- vsd.TZ
+  }
+  
+  sampleDists <- dist(t(assay(vsd)))
+
+  # visualize the distances
+  library("pheatmap")
+  library("RColorBrewer")
+  
+  sampleDistMatrix <- as.matrix( sampleDists )
+  rownames(sampleDistMatrix) <- paste( vsd$Group, vsd$Sample, sep = " - " )
+  colnames(sampleDistMatrix) <- NULL
+  colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+  pheatmap(sampleDistMatrix,
+           clustering_distance_rows = sampleDists,
+           clustering_distance_cols = sampleDists,
+           col = colors,
+           fontsize_row = 7,
+           main = paste0("Euclidean Distance, vsd data, ", T))
+}
+
+
+
+```
+
+
+
+Heatmap of sample-to-sample distances using Poisson distance:
+
+```{r distance.poisson}
+# Heatmap of sample-to-sample distances using Poisson distance
+library("PoiClaClu")
+
+for (T in c("PZ", "TZ")){
+  
+  if (T=="PZ"){
+    dds <- dds.PZ
+    plot.t <- "Peripheral Zone"
+  }
+  if (T=="TZ"){
+    dds <- dds.TZ
+    plot.t <- "Transitional Zone"
+  }
+    
+  poisd <- PoissonDistance(t(counts(dds)))
+  samplePoisDistMatrix <- as.matrix( poisd$dd )
+  # add treatment name for the rows 
+  library(stringr)
+  hc.rownames <- dds$Group
+  rownames(samplePoisDistMatrix) <- hc.rownames
+  
+  # do not include column names
+  colnames(samplePoisDistMatrix) <- NULL
+  pheatmap(samplePoisDistMatrix,
+           clustering_distance_rows = poisd$dd,
+           clustering_distance_cols = poisd$dd,
+           col = colors,
+           fontsize_row = 7,
+           main = paste0("Poisson distances for ", plot.t))
+  
+  if (saveFiles){
+    # do not include column names
+    colnames(samplePoisDistMatrix) <- NULL
+    pheatmap(samplePoisDistMatrix,
+             clustering_distance_rows = poisd$dd,
+             clustering_distance_cols = poisd$dd,
+             col = colors,
+             fontsize_row = 7,
+             filename = paste(FIGLOC,"hc-poisson-", T, ".png", sep = ""),
+             main = paste0("Poisson distances for ", plot.t))
+  }
+}
+
+
+```
+
+## Principal Component Analysis, PCA
+
+In this section we plot the first two components of PCA using the VST DATA. 
+
+
+
+### PCA for PZ samples
+
+The samples are colour-coded by GRN and non-GRN interventions, and the individual groups are represented by different shapes.
+
+
+```{r pca.vst.PZ}
+
+T="PZ"  
+zoneTitle <- "Peripheral Zone"
+
+vsd <- vsd.PZ
+vsd$Intervention <- "GRN"
+vsd$Intervention[vsd$TreatA == 0] <- "Non-GRN"
+vsd$Intervention <- as.factor(vsd$Intervention)
+vsd$Intervention <- relevel(vsd$Intervention, ref = "Non-GRN")
+
+vsd$Group <- factor(vsd$Group, levels = c("Placebo/Placebo", "Alliin/Placebo", "GRN/Placebo", "GRN/Alliin"))
+
+pcaData <- plotPCA(vsd, intgroup = c("TreatA","Group","Intervention"), returnData = TRUE ) 
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(x = PC1, y = PC2, color = Intervention, shape = Group)) +
+  geom_point(size =3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  ggtitle(paste0("PCA plot using the VST data for GRN, ", zoneTitle))
+  
+if (saveFiles){
+  ggsave(paste0(FIGLOC,"PCA.GRN.PZ.pdf"))
+}
+
+```
+
+### PCA for TZ samples
+
+The samples are colour-coded by GRN and non-GRN interventions, and the individual groups are represented by different shapes.
+
+
+```{r pca.vst.TZ}
+
+T="TZ"
+zoneTitle <- "Transitional Zone"
+vsd <- vsd.TZ
+vsd$Intervention <- "GRN"
+vsd$Intervention[vsd$TreatA == 0] <- "Non-GRN"
+vsd$Intervention <- as.factor(vsd$Intervention)
+vsd$Intervention <- relevel(vsd$Intervention, ref = "Non-GRN")
+
+vsd$Group <- factor(vsd$Group, levels = c("Placebo/Placebo", "Alliin/Placebo", "GRN/Placebo", "GRN/Alliin"))
+
+pcaData <- plotPCA(vsd, intgroup = c("TreatA","Intervention", "Group"), returnData = TRUE ) 
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(x = PC1, y = PC2, color = Intervention, shape = Group)) +
+  geom_point(size =3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  ggtitle(paste0("PCA plot using the VST data for GRN, ", zoneTitle))
+
+if (saveFiles){
+  ggsave(paste0(FIGLOC, "PCA.GRN.TZ.pdf"))
+}
+
+
+```
+
+
+
+### PCA for Control samples: Peripheral vs Transitional Zones
+
+We perform PCA to explore the transcriptomic profiles of the two zones, using only control samples (Placebo/Placebo group).
+
+```{r pca.vst.AC.PZ.TZ}
+
+# using ggplot2 to plot PCA, with no sample names
+vsdT <- vsd.PP
+vsdT$ZoneCode <- as.factor(vsdT$ZoneCode)
+
+pcaData <- plotPCA(vsdT, intgroup = c("ZoneCode"), returnData = TRUE ) 
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(x = PC1, y = PC2, color = ZoneCode, shape = ZoneCode)) +
+  geom_point(size =3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("PCA plot using the VST data for Control Samples: PZ and TZ")
+  
+
+```
+
+
+
+## Part 2: Differential Expression Analysis
+
+Differntial expression analysis is done with DESeq2 on each zone separately to test for the main effect of the treatments: Glucoraphanin  (TreatA) and Alliin (TreatB). We use the following design: 
+
+design = ~TreatA + TreatB  
+
+
+After testing the effect of each treatment, we will test if there are any significant interactions using the design:
+
+design = ~TreatA + TreatB + TreatA:TreatB
+
+
+
+Furthermore, shrinkage of effect size (LFC estimates) is useful for visualising and ranking of genes. 
+Here we use the apeglm method for shrinking coefficients as it is good for shrinking the noisy log FC estimates while giving low bias LFC estimated for true differences [Zhum, Ibrahim and Love, 2018]
+
+
+NOTE:  DESeq2 includes a function that automatically replace counts with large Cook's distance with the trimmed mean over all samples, scaled up by the size factor for that sample. 
+Using "minReplicatesForReplace = Inf", this replacement function is switched off.
+
+
+### Main effect of the two treatments (design = ~TreatA + TreatB)
+
+```{r diff.expression}
+
+##  Differential Expression for samples in the Peripheral Zone  ##
+dds.PZ <- DESeq(dds.PZ, minReplicatesForReplace = Inf)
+
+##    ---- Building results table for BC,BD  vs  AD,AC ----
+res.BC.PZ <- results(dds.PZ, contrast = c("TreatA", "1", "0"))
+summary(res.BC.PZ)
+res.BC.PZ.shrink <- lfcShrink(dds.PZ, coef="TreatA_1_vs_0", type="apeglm", res = res.BC.PZ)
+summary(res.BC.PZ.shrink)
+
+
+##   ---- Building results table for AD,BD  vs  BC,AC" ----
+res.AD.PZ <- results(dds.PZ, contrast = c("TreatB", "1", "0"))
+summary(res.AD.PZ)
+res.AD.PZ.shrink <- lfcShrink(dds.PZ, coef="TreatB_1_vs_0", type="apeglm", res = res.AD.PZ)
+summary(res.AD.PZ.shrink)
+
+
+
+##  Differential Expression for samples in the Transitional Zone ##
+dds.TZ <- DESeq(dds.TZ, minReplicatesForReplace = Inf)
+
+#  ---- Building results table for BC,BD  vs  AD,AC" ----
+res.BC.TZ <- results(dds.TZ, contrast = c("TreatA", "1", "0"))
+summary(res.BC.TZ)
+res.BC.TZ.shrink <- lfcShrink(dds.TZ, coef="TreatA_1_vs_0", type="apeglm", res = res.BC.TZ)
+summary(res.BC.TZ.shrink)
+
+
+##   ---- Building results table for AD,BD  vs  BC,AC" ----
+res.AD.TZ <- results(dds.TZ, contrast = c("TreatB", "1", "0"))
+summary(res.AD.TZ)
+res.AD.TZ.shrink <- lfcShrink(dds.TZ, coef="TreatB_1_vs_0", type="apeglm", res = res.AD.TZ)
+summary(res.AD.TZ.shrink)
+
+```
+
+
+
+### Test for any significant interactions  (design = ~TreatA + TreatB + TreatA:TreatB)
+
+
+```{r DE.M2}
+# Peripheral Zone
+# Testing Model 2 (interaction) for the Peripheral Zone
+dds.M2.PZ <- DESeq(dds.M2.PZ, test = "LRT", reduced = ~TreatA + TreatB)
+
+# Coefficients in the fitted model:
+resultsNames(dds.M2.PZ)
+
+# The coefficientes for the interaction (stored as the last coefficient)
+# These are the results for the interaction coefficient:
+res.M2.PZ.interaction <- results(dds.M2.PZ)
+summary(res.M2.PZ.interaction)
+
+
+# Transitional Zone
+# Testing Model 2 (interaction) for the Transitional Zone
+dds.M2.TZ <- DESeq(dds.M2.TZ, test = "LRT", reduced = ~TreatA + TreatB)
+# Coefficients in the fitted model
+resultsNames(dds.M2.TZ)
+
+# The coefficientes for the interaction (stored as the last coefficient)
+# These are the results for the interaction coefficient:
+res.M2.TZ.interaction <- results(dds.M2.TZ)
+summary(res.M2.TZ.interaction)
+
+
+```
+
+### Diagnostic Plots
+
+#### Histogram of p-values
+
+Histogram of p-values for the main effect of the treatments in the prostate zones.
+
+```{r histogram.pvalues}
+res <- res.BC.PZ
+hist(res$pvalue[res$baseMean > 1], breaks = 0:100/100,
+     col = "grey50", border = "white",
+     xlab = "p-value",
+     main = "p-values for the effect of GRN on the Peripheral Zone")
+
+res <- res.AD.PZ
+hist(res$pvalue[res$baseMean > 1], breaks = 0:100/100,
+     col = "grey50", border = "white",
+     xlab = "p-value",
+     main = "p-values for the effect of Alliin on the Peripheral Zone")
+
+res <- res.BC.TZ
+hist(res$pvalue[res$baseMean > 1], breaks = 0:100/100,
+     col = "grey50", border = "white",
+     xlab = "p-value",
+     main = "p-values for the effect of GRN on the Transitional Zone")
+
+res <- res.AD.TZ
+hist(res$pvalue[res$baseMean > 1], breaks = 0:100/100,
+     col = "grey50", border = "white",
+     xlab = "p-value",
+     main = "p-values for the effect of Alliin on the Transitional Zone")
+```
+
+
+
+Histogram of p-values for the interaction of the treatments in the prostate zones.
+
+```{r histogram.pvalues.interaction}
+res <- res.M2.PZ.interaction
+
+hist(res$pvalue[res$baseMean > 1], breaks = 0:100/100,
+     col = "grey50", border = "white", 
+     main = "Effect from the interaction GRN + Alliin, Peripheral Zone")
+
+
+res <- res.M2.TZ.interaction
+
+hist(res$pvalue[res$baseMean > 1], breaks = 0:100/100,
+     col = "grey50", border = "white",
+     main = "Effect from the interaction GRN + Alliin, Transitional Zone")
+
+
+```
+
+
+
+#### Estimating Size Factors
+
+```{r size.factors}
+
+sizeFactors(dds.PZ)
+colSums(counts(dds.PZ))
+
+sizeFactors(dds.TZ)
+colSums(counts(dds.TZ))
+  
+# Size Factors for PZ
+par(mfrow=c(1,2))
+for (Z in c("PZ", "TZ")){
+  if (Z == "PZ"){
+    dds <- dds.PZ
+    tplot <- "Peripheral"
+  }else{
+    dds <- dds.TZ
+    tplot <- "Transitional"
+  }
+  
+  sizeFactors(dds)
+  colSums(counts(dds))
+  
+  plot(sizeFactors(dds), colSums(counts(dds)))
+  title(main = tplot)
+  abline(lm(colSums(counts(dds)) ~ sizeFactors(dds) + 0))  
+  
+}
+
+
+
+
+```
+
+
+
+#### Mean-Variance relationship
+
+Another useful diagnostic plot is to visualise the mean-variance relationship. 
+The plot below shows the variance in gene expression increases with mean expression, where each black dot is a gene. 
+
+
+```{r mean.variance}
+
+## PZ
+Z = "PZ"
+dds <- dds.PZ
+
+# Calculating mean for each gene
+mean.Counts <- apply(assay(dds), 1, mean)
+
+# Calculating variance for each gene
+var.Counts <- apply(assay(dds), 1, var)
+
+
+# Plot the mean versus variance in read count data
+df <- data.frame(mean.Counts, var.Counts)
+
+ggplot(df) +
+  geom_point(aes(x=mean.Counts, y= var.Counts)) +
+  scale_y_log10() +
+  scale_x_log10() +
+  xlab("Mean counts per gene") +
+  ylab("Variance per gene") +
+  labs(title = paste0("DESeq2 model - Dispersion: ", Z))
+
+
+## TZ
+Z = "TZ"
+dds <- dds.TZ
+
+# Calculating mean for each gene
+mean.Counts <- apply(assay(dds), 1, mean)
+
+# Calculating variance for each gene
+var.Counts <- apply(assay(dds), 1, var)
+
+
+# Plot the mean versus variance in read count data
+df <- data.frame(mean.Counts, var.Counts)
+
+ggplot(df) +
+  geom_point(aes(x=mean.Counts, y= var.Counts)) +
+  scale_y_log10() +
+  scale_x_log10() +
+  xlab("Mean counts per gene") +
+  ylab("Variance per gene") +
+  labs(title = paste0("DESeq2 model - Dispersion: ", Z))
+  
+
+
+```
+
+
+#### MA Plot 
+
+The MA plot shows the fold change over the average expression level of all samples.
+
+
+```{r MA.plot}
+
+par(mfrow=c(2,2))
+for (T in c("BC.PZ", "AD.PZ", "BC.TZ", "AD.TZ")){
+  if (T == "BC.PZ"){  
+    res <- res.BC.PZ
+    tplot <- "MA-plot: Glucoraphanin, PZ"
+  }
+  if (T == "AD.PZ"){
+    res <- res.AD.PZ
+    tplot <- "MA-plot: Alliin, PZ"
+  }
+  if (T == "BC.TZ"){
+    res <- res.BC.TZ
+    tplot <- "MA-plot: Glucoraphanin, TZ"
+  }
+  if (T == "AD.TZ"){
+    res <- res.AD.TZ
+    tplot <- "MA-plot: Alliin, TZ"
+  }
+  
+  plotMA(res, ylim=c(-5,5), main = tplot)
+  
+}
+
+
+
+```
+
+
+#### Dispersion
+
+Plotting the dispersion estimates is a useful diagnostic for the model. The plot shows the gene-wise estimates towards the fitted estimates.  
+
+```{r dispersion}
+
+for (Z in c("PZ", "TZ")){
+  if (Z == "PZ"){
+    dds <- dds.PZ
+  }else{
+    dds <- dds.TZ
+  }
+  
+  
+  plotDispEsts(dds, main = Z)
+}
+
+
+```
+
+
+
+### Multiple Testing
+
+Using Benjamini-Hochberg (BH) adjustment.
+
+This method calculates for each gene an adjusted pvalue that answers the question:
+if one called significant all genes with an adjusted p value less than or equal to this
+gene's adjusted p value threshold, what would be the fraction of false positives
+(the false discovery rate, FDR) among them?
+These values, called the BH-adjusted p values, are given in
+the column q.value in the following tables.
+
+For multiple testin, if we consider a fraction of 10% false positives acceptable, we can consider
+all genes with an adjusted p value below 10%=0.1 as significant.
+
+
+```{r MultipleTesting, warning=FALSE, echo=FALSE}
+# Number of genes that pass the test (with a p.value)
+p.val <- c(sum(!is.na(res.BC.PZ$pvalue)),
+           sum(!is.na(res.AD.PZ$pvalue)),
+           sum(!is.na(res.BC.TZ$pvalue)),
+           sum(!is.na(res.AD.TZ$pvalue)))
+
+p.val.0.1 <- c(sum(res.BC.PZ$pvalue<0.1, na.rm = TRUE),
+               sum(res.AD.PZ$pvalue<0.1, na.rm = TRUE),
+               sum(res.BC.TZ$pvalue<0.1, na.rm = TRUE),
+               sum(res.AD.TZ$pvalue<0.1, na.rm = TRUE))
+
+p.val.0.05 <- c(sum(res.BC.PZ$pvalue<0.05, na.rm = TRUE),
+                sum(res.AD.PZ$pvalue<0.05, na.rm = TRUE),
+                sum(res.BC.TZ$pvalue<0.05, na.rm = TRUE),
+                sum(res.AD.TZ$pvalue<0.05, na.rm = TRUE))
+
+q.val.0.1 <- c(sum(res.BC.PZ$padj<0.1, na.rm = TRUE),
+               sum(res.AD.PZ$padj<0.1, na.rm = TRUE),
+               sum(res.BC.TZ$padj<0.1, na.rm = TRUE),
+               sum(res.AD.TZ$padj<0.1, na.rm = TRUE))
+
+q.val.0.05 <- c(sum(res.BC.PZ$padj<0.05, na.rm = TRUE),
+                sum(res.AD.PZ$padj<0.05, na.rm = TRUE),
+                sum(res.BC.TZ$padj<0.05, na.rm = TRUE),
+                sum(res.AD.TZ$padj<0.05, na.rm = TRUE))
+
+
+M <- data.frame( Treatment = c("GRN", "Alliin"),
+                 Prostate.Zone = c("PZ", "PZ", "TZ", "TZ"),
+                 Pass.Wald.Test = p.val,
+                 p.value.0.1 = p.val.0.1,
+                 p.value.0.05 = p.val.0.05,
+                 q.value.0.1 = q.val.0.1,
+                 q.value.0.05 = q.val.0.05)
+kable(M)
+
+if (saveFiles){
+  fName <- paste0(DELOC, "DE-multiple-testing.txt")
+  write.table(M, file = fName, sep = "\t", row.names = FALSE)
+  print(paste0("Table saved to file: ", fName))
+}
+
+
+# The following table contains only q.values
+q.val.0.5 <- c(sum(res.BC.PZ$padj<0.5, na.rm = TRUE),
+               sum(res.AD.PZ$padj<0.5, na.rm = TRUE),
+               sum(res.BC.TZ$padj<0.5, na.rm = TRUE),
+               sum(res.AD.TZ$padj<0.5, na.rm = TRUE))
+q.val.0.2 <- c(sum(res.BC.PZ$padj<0.2, na.rm = TRUE),
+               sum(res.AD.PZ$padj<0.2, na.rm = TRUE),
+               sum(res.BC.TZ$padj<0.2, na.rm = TRUE),
+               sum(res.AD.TZ$padj<0.2, na.rm = TRUE))
+q.val.0.01 <- c(sum(res.BC.PZ$padj<0.01, na.rm = TRUE),
+               sum(res.AD.PZ$padj<0.01, na.rm = TRUE),
+               sum(res.BC.TZ$padj<0.01, na.rm = TRUE),
+               sum(res.AD.TZ$padj<0.01, na.rm = TRUE))
+
+M <- data.frame( Treatment = c("GRN", "Alliin", "GRN",  "Alliin"),
+                 Prostate.Zone = c("PZ", "PZ", "TZ", "TZ"),
+                 q.value.0.5 = q.val.0.5,
+                 q.value.0.2 = q.val.0.2,
+                 q.value.0.1 = q.val.0.1,
+                 q.value.0.05 = q.val.0.05,
+                 q.value.0.01 = q.val.0.01)
+kable(M)
+
+if (saveFiles){
+  fName <- paste0(DELOC, "DE-multiple-testing.qval.txt")
+  write.table(M, file = fName, sep = "\t", row.names = FALSE)
+  print(paste0("Table saved to file: ", fName))
+}
+# end
+
+
+p.val.0.1.up <- c(sum(res.BC.PZ$pvalue<0.1 & res.BC.PZ$log2FoldChange>0, na.rm = TRUE),
+                  sum(res.AD.PZ$pvalue<0.1 & res.AD.PZ$log2FoldChange>0, na.rm = TRUE),
+                  sum(res.BC.TZ$pvalue<0.1 & res.BC.TZ$log2FoldChange>0, na.rm = TRUE),
+                  sum(res.AD.TZ$pvalue<0.1 & res.AD.TZ$log2FoldChange>0, na.rm = TRUE))
+
+p.val.0.1.down <- c(sum(res.BC.PZ$pvalue<0.1 & res.BC.PZ$log2FoldChange<0, na.rm = TRUE),
+                    sum(res.AD.PZ$pvalue<0.1 & res.AD.PZ$log2FoldChange<0, na.rm = TRUE),
+                    sum(res.BC.TZ$pvalue<0.1 & res.BC.TZ$log2FoldChange<0, na.rm = TRUE),
+                    sum(res.AD.TZ$pvalue<0.1 & res.AD.TZ$log2FoldChange<0, na.rm = TRUE))
+
+p.val.0.05.up <- c(sum(res.BC.PZ$pvalue<0.05 & res.BC.PZ$log2FoldChange>0, na.rm = TRUE),
+                   sum(res.AD.PZ$pvalue<0.05 & res.AD.PZ$log2FoldChange>0, na.rm = TRUE),
+                   sum(res.BC.TZ$pvalue<0.05 & res.BC.TZ$log2FoldChange>0, na.rm = TRUE),
+                   sum(res.AD.TZ$pvalue<0.05 & res.AD.TZ$log2FoldChange>0, na.rm = TRUE))
+
+p.val.0.05.down <- c(sum(res.BC.PZ$pvalue<0.05 & res.BC.PZ$log2FoldChange<0, na.rm = TRUE),
+                     sum(res.AD.PZ$pvalue<0.05 & res.AD.PZ$log2FoldChange<0, na.rm = TRUE),
+                     sum(res.BC.TZ$pvalue<0.05 & res.BC.TZ$log2FoldChange<0, na.rm = TRUE),
+                     sum(res.AD.TZ$pvalue<0.05 & res.AD.TZ$log2FoldChange<0, na.rm = TRUE))
+
+q.val.0.1.up <- c(sum(res.BC.PZ$padj<0.1 & res.BC.PZ$log2FoldChange>0, na.rm = TRUE),
+                  sum(res.AD.PZ$padj<0.1 & res.AD.PZ$log2FoldChange>0, na.rm = TRUE),
+                  sum(res.BC.TZ$padj<0.1 & res.BC.TZ$log2FoldChange>0, na.rm = TRUE),
+                  sum(res.AD.TZ$padj<0.1 & res.AD.TZ$log2FoldChange>0, na.rm = TRUE))
+
+q.val.0.1.down <- c(sum(res.BC.PZ$padj<0.1 & res.BC.PZ$log2FoldChange<0, na.rm = TRUE),
+                    sum(res.AD.PZ$padj<0.1 & res.AD.PZ$log2FoldChange<0, na.rm = TRUE),
+                    sum(res.BC.TZ$padj<0.1 & res.BC.TZ$log2FoldChange<0, na.rm = TRUE),
+                    sum(res.AD.TZ$padj<0.1 & res.AD.TZ$log2FoldChange<0, na.rm = TRUE))
+
+q.val.0.05.up <- c(sum(res.BC.PZ$padj<0.05 & res.BC.PZ$log2FoldChange>0, na.rm = TRUE),
+                   sum(res.AD.PZ$padj<0.05 & res.AD.PZ$log2FoldChange>0, na.rm = TRUE),
+                   sum(res.BC.TZ$padj<0.05 & res.BC.TZ$log2FoldChange>0, na.rm = TRUE),
+                   sum(res.AD.TZ$padj<0.05 & res.AD.TZ$log2FoldChange>0, na.rm = TRUE))
+
+q.val.0.05.down <- c(sum(res.BC.PZ$padj<0.05 & res.BC.PZ$log2FoldChange<0, na.rm = TRUE),
+                     sum(res.AD.PZ$padj<0.05 & res.AD.PZ$log2FoldChange<0, na.rm = TRUE),
+                     sum(res.BC.TZ$padj<0.05 & res.BC.TZ$log2FoldChange<0, na.rm = TRUE),
+                     sum(res.AD.TZ$padj<0.05 & res.AD.TZ$log2FoldChange<0, na.rm = TRUE))
+
+
+M.up.down <- data.frame( Treatment = c("GRN.PZ", "Alliin.PZ", "GRN.TZ", "Alliin.TZ"),
+                 p.val.0.1.up = p.val.0.1.up,
+                 p.val.0.1.down = p.val.0.1.down,
+                 p.val.0.05.up = p.val.0.05.up,
+                 p.val.0.05.down = p.val.0.05.down,
+                 q.val.0.1.up = q.val.0.1.up,
+                 q.val.0.1.down = q.val.0.1.down,
+                 q.val.0.05.up = q.val.0.05.up,
+                 q.val.0.05.down = q.val.0.05.down)
+
+kable(M.up.down)
+
+if (saveFiles){
+  fName <- paste0(DELOC, "DE-multiple-testing-up-down.txt")
+  write.table(M.up.down, file = fName, sep = "\t", row.names = FALSE)
+  print(paste0("Table saved to file: ", fName))
+}
+
+
+
+```
+
+
+
+### Annotating Genes
+
+
+In this section, genes are annotated with ensembl IDs, HGNC symbol names and entrez names and descriptions. The annotated genes are saved to file, with the following file name format (if saveFiles variable is set to true):
+
+```results/DE-DESeq2/\<ZONE\>\_DE\_\<TREATMENT\>_all-genes_annotation_prefiltering.txt```
+
+
+In addition, genes are ranked for GSEA using the following score:
+
+```sign-log2FC * log10 (p-value)```
+
+and save to file following the file name format:
+
+
+```results/DE-DESeq2/\<ZONE\>\_\<TREATMENT\>_ranked-genes_ensembl.rnk ```
+
+
+
+```{r annotation, eval=TRUE}
+
+# Annotation with biomaRt's useEnsembl function
+ensembl = useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+
+# Adding annotation to the results of each of the four tests: GRN and Alliin in both PZ and TZ
+for (T in c("BC.PZ", "AD.PZ", "BC.TZ", "AD.TZ")){
+
+    # GRN.PZ
+    if (T == "BC.PZ"){
+      tr <- "GRN"
+      zone <- "PZ"
+      res <- res.BC.PZ
+    }
+  
+    # Alliin.PZ
+    if (T == "AD.PZ"){
+      tr <- "Alliin"
+      zone <- "PZ"
+      res <- res.AD.PZ
+    }
+    
+    # GRN.TZ
+    if (T == "BC.TZ"){
+      tr <- "GRN"
+      zone <- "TZ"
+      res <- res.BC.TZ
+    }
+  
+    # Alliin.TZ  
+    if (T == "AD.TZ"){
+      tr <- "Alliin"
+      zone <- "TZ"
+      res <- res.AD.TZ
+    }
+  
+    
+    print(paste0("Processing: ", tr, ", zone: ", zone))
+    qvalue <- 0.1
+
+    # Gene symbols
+    res$ensemblID <- rownames(res)
+    
+    # list of attributes to retrieve
+    ensembl.attributes <- listAttributes(ensembl)
+    annot <- getBM(attributes=c('ensembl_gene_id','description', 'entrezgene_description',
+                                 'hgnc_symbol','external_gene_name','gene_biotype'),
+                    filters = 'ensembl_gene_id', 
+                    values = res$ensemblID, 
+                    mart = ensembl)
+    
+    # find the annotation for each gene
+    hngc.symbol <- integer(length(res$ensemblID))
+    entrez.desc <- integer(length(res$ensemblID))
+    name <- integer(length(res$ensemblID))
+    type <- integer(length(res$ensemblID))
+    description <- integer(length(res$ensemblID))
+    for (ii in c(1:length(res$ensemblID))){
+      g.ensembl <- res$ensemblID[ii]
+      
+      indx <- which(annot$ensembl_gene_id == g.ensembl)
+      if (length(indx)==1){
+        hngc.symbol[ii] <- annot$hgnc_symbol[indx]
+        entrez.desc[ii] <- annot$entrezgene_description[indx]
+        name[ii] <- annot$external_gene_name[indx]
+        type[ii] <- annot$gene_biotype[indx]
+        description[ii] <- annot$description[indx]
+        
+        } else if (length(indx)>0) { # if there is more than one symbol, use the first match
+          hngc.symbol[ii] <- annot$hgnc_symbol[indx[1]]
+          entrez.desc[ii] <- annot$entrezgene_description[indx[1]]
+          name[ii] <- annot$external_gene_name[indx[1]]
+          type[ii] <- annot$gene_biotype[indx[1]]
+          description[ii] <- annot$description[indx[1]]
+        } else {    # if there is no annotation, for example is a gene was retired from ensembl, add NA
+          hngc.symbol[ii] <- "NA"
+          entrez.desc[ii] <- "NA"
+          name[ii] <- "NA"
+          type[ii] <- "NA"
+          description[ii] <- "NA"
+        }
+    }
+    
+    # If hngc.symbol is empty, add "NA"
+    hngc.symbol[which(hngc.symbol == "")] = "NA"
+    entrez.desc[which(entrez.desc == "")] = "NA"
+  
+    res$hngc.symbol <- hngc.symbol  
+    res$description <- description
+    res$entrez.desc <- entrez.desc
+    res$name <- name
+    res$biotype <- type
+    
+    ## Update RES object with the annotation
+    
+    if (T == "BC.PZ"){
+      res.BC.PZ <- res
+    }
+    
+    if (T == "AD.PZ"){
+      res.AD.PZ <- res
+    }
+    
+    if (T == "BC.TZ"){
+      res.BC.TZ <- res
+    }
+    
+    if (T == "AD.TZ"){
+      res.AD.TZ <- res
+    }
+    
+    
+    ## Save the results to file, keep all genes, even those with p.value = NA
+    resOrdered <- res[order(res$padj),]
+    head(resOrdered)
+    
+    
+    # Save the results for all genes
+    resAll <- as.data.frame(resOrdered)
+    TResAll <- data.frame(ensemblID = resAll$ensemblID,
+                          HGNC.symbol = resAll$hngc.symbol,
+                          baseMean = resAll$baseMean,
+                          log2FoldChange = resAll$log2FoldChange,
+                          lfcSE = resAll$lfcSE,
+                          pvalue = resAll$pvalue,
+                          padj = resAll$padj,
+                          description = resAll$description,
+                          entrez.description = resAll$entrez.desc,
+                          gene.name = resAll$name,
+                          gene.biotype = resAll$biotype)
+    
+    if (saveFiles){
+      res.all.File <- paste0(DELOC,
+                           zone,"_DE_",tr,"_all-genes_annotation_", threshold, ".txt")
+      print(paste0("Saving results to file: ", res.all.File, "..."))
+      write.table(TResAll, file = res.all.File, quote = FALSE, row.names = FALSE, sep = "\t")
+      print("done!")
+    }
+    
+    #### Rank Genes for GSEA ####
+    print("Ranking genes for GSEA")
+    # Get subset of genes with no p.value (NA)
+    indx <- !is.na(TResAll$pvalue)
+    subset <- TResAll[indx,]
+   
+    sprintf("Reading gene IDs ...")
+    ensemblID <- as.character(subset$ensemblID)
+    head(ensemblID)
+    
+    # p-values
+    pval <- subset$pvalue
+    # log2 Fold Change
+    fc <- as.numeric(subset$log2FoldChange)
+  
+    # calculate log 10 of p-values
+    log10.pvalues <- log10(pval)
+    
+    # The score takes the sign of the logFC
+    # indexes to all negative logFC
+    indx2 <- fc<0
+  
+    # list of ranked genes
+    #  score = sign FC * (- log10pvalue)
+    #  sort score : descending order
+    score <- -log10.pvalues
+    score[indx2==TRUE] <- -score[indx2==TRUE]
+    r <- data.frame( ensemblID = ensemblID, score = score)
+    rsorted <- r[order(-r$score),]
+    
+    if (saveFiles){
+      rnkFile <- paste0(DELOC,
+                        zone,"_",tr,"_ranked-genes_ensembl.rnk")
+      # Save ranked genes to file:
+      write.table(rsorted, file = rnkFile, row.names = FALSE, col.names = FALSE, sep = "\t", quote = TRUE)
+      print(paste0("Ranked list saved to file: ", rnkFile))
+      print("Done!!")
+  
+    }
+    
+    
+}
+
+
+
+```
+
+
+### Plotting Results
+
+A quick way to visualise the counts for a particular gene. In this section, genes with the smallest adjusted p-values are plotted for each of the tests. Genes are annotated with their HNGC symbol or their ensembl ID when gene symbol is not available.
+
+
+#### Differential genes for GRN in PZ
+
+The following are the 10 genes with the smallest FDR-adjusted p-value for the effect of GRN on the Peripheral Zone.
+
+```{r plot.GRN.PZ}
+
+Z <- "GRN, PZ"
+res <- res.BC.PZ
+dds <- dds.PZ
+gTitle <- "Genes with smallest adj-pval for GRN, PZ"
+
+
+# Top 10 genes with smallest q.value
+subset.top <- res[ order(res$padj, decreasing = FALSE), ][1:10,]
+print(subset.top)
+
+for (ti in c(1:10)){
+  topGene <- rownames(subset.top)[ti]
+  if (subset.top$hngc.symbol[ti] == "NA"){
+    topGeneName <- topGene
+  }else{
+    topGeneName <- subset.top$hngc.symbol[ti]
+  }
+  toppval <- subset.top$pvalue[ti]
+  topqval <- subset.top$padj[ti]
+  normCounts <- plotCounts(dds, gene = topGene, intgroup = c("Group"), returnData = TRUE)
+  normCounts$Gene <- topGene
+  normCounts$GeneName <- topGeneName
+  normCounts$pval <- toppval
+  normCounts$qval <- topqval
+  normCounts$title <- paste0(topGeneName, ", pval=", format(toppval, digits=3), ", qval=", format(topqval, digits=3) )
+  head(normCounts)
+  if (ti==1){
+    TopNormCounts <- normCounts
+  }else{
+    TopNormCounts <- rbind(TopNormCounts, normCounts)
+  }
+  
+}
+
+TopNormCounts$Group <- factor(TopNormCounts$Group, levels = c("GRN/Placebo", "GRN/Alliin", 
+                                                              "Alliin/Placebo", "Placebo/Placebo"))
+## The following plots all the genes into one figure
+pfig <- ggplot(TopNormCounts, aes(x = GeneName, y = count, fill = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_log10() +
+  xlab("Gene Name") +
+  ylab("Normalised Gene Expression") +
+  ggtitle(gTitle)
+pfig
+
+
+```
+
+
+#### Differential genes for GRN in TZ
+
+The following are the 10 genes with the smallest FDR-adjusted p-value for the effect of GRN on the Transitional Zone.
+
+```{r plot.GRN.TZ}
+
+Z <- "GRN, TZ"
+res <- res.BC.TZ
+dds <- dds.TZ
+gTitle <- "Genes with smallest adj-pval for GRN, TZ"
+
+
+# The 10 genes with the smallest adjusted p-value
+subset.top <- res[ order(res$padj, decreasing = FALSE), ][1:10,]
+print(subset.top)
+
+
+for (ti in c(1:10)){
+  topGene <- subset.top$ensemblID[ti]
+  if (subset.top$hngc.symbol[ti] == "NA"){
+    topGeneName <- topGene
+  }else{
+    topGeneName <- subset.top$hngc.symbol[ti]
+  }
+  toppval <- subset.top$pvalue[ti]
+  topqval <- subset.top$padj[ti]
+  normCounts <- plotCounts(dds, gene = topGene, intgroup = c("Group"), returnData = TRUE)
+  normCounts$Gene <- topGene
+  normCounts$GeneName <- topGeneName
+  normCounts$pval <- toppval
+  normCounts$qval <- topqval
+  normCounts$title <- paste0(topGeneName, ", pval=", format(toppval, digits=3), ", qval=", format(topqval, digits=3) )
+  head(normCounts)
+  if (ti==1){
+    TopNormCounts <- normCounts
+  }else{
+    TopNormCounts <- rbind(TopNormCounts, normCounts)
+  }
+  
+}
+
+TopNormCounts$Group <- factor(TopNormCounts$Group, levels = c("GRN/Placebo", "GRN/Alliin", 
+                                                              "Alliin/Placebo", "Placebo/Placebo"))
+## The following plots all the genes into one figure
+pfig <- ggplot(TopNormCounts, aes(x = GeneName, y = count, fill = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_log10() +
+  xlab("Gene Name") +
+  ylab("Normalised Gene Expression") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  ggtitle(gTitle)
+pfig
+
+```
+
+
+#### Differential genes for Alliin in PZ
+
+The following are the 10 genes with the smallest FDR-adjusted p-value for the effect of Alliin on the Peripheral Zone.
+
+```{r plot.Alliin.PZ}
+# For AC.PZ
+Z <- "Alliin, PZ"
+res <- res.AD.PZ
+dds <- dds.PZ
+gTitle <- "Genes with smallest adj-pval for Alliin, PZ"
+
+print(paste0("Genes with smallest adj.p.values for ", Z))
+
+# The 10 genes with the smallest adjusted p-value
+subset.top <- res[ order(res$padj, decreasing = FALSE), ][1:10,]
+print(subset.top)
+
+for (ti in c(1:10)){
+  topGene <- rownames(subset.top)[ti]
+  if (subset.top$hngc.symbol[ti] == "NA"){
+    topGeneName <- topGene
+  }else{
+    topGeneName <- subset.top$hngc.symbol[ti]
+  }
+  toppval <- subset.top$pvalue[ti]
+  topqval <- subset.top$padj[ti]
+  normCounts <- plotCounts(dds, gene = topGene, intgroup = c("Group"), returnData = TRUE)
+  normCounts$Gene <- topGene
+  normCounts$GeneName <- topGeneName
+  normCounts$pval <- toppval
+  normCounts$qval <- topqval
+  normCounts$title <- paste0(topGeneName, ", pval=", format(toppval, digits=3), ", qval=", format(topqval, digits=3) )
+  head(normCounts)
+  if (ti==1){
+    TopNormCounts <- normCounts
+  }else{
+    TopNormCounts <- rbind(TopNormCounts, normCounts)
+  }
+  
+}
+
+TopNormCounts$Group <- factor(TopNormCounts$Group, levels = c("Alliin/Placebo", "GRN/Alliin", 
+                                                              "GRN/Placebo", "Placebo/Placebo"))
+## Figure to include all the genes into one figure with no faceting
+pfig <- ggplot(TopNormCounts, aes(x = GeneName, y = count, fill = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_log10() +
+  xlab("Gene Name") +
+  ylab("Normalised Gene Expression") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  ggtitle(gTitle)
+pfig
+
+
+```
+
+#### Differential genes for Alliin in TZ
+
+The following are the 10 genes with the smallest FDR-adjusted p-value for the effect of Alliin on the Transitional Zone.
+
+```{r plot.Alliin.TZ}
+
+Z <- "Alliin, TZ"
+res <- res.AD.TZ
+dds <- dds.TZ
+gTitle <- "Genes with smallest adj-pval for Alliin, TZ"
+
+
+# The 10 genes with smallest adjusted p-value
+subset.top <- res[ order(res$padj, decreasing = FALSE), ][1:10,]
+print(subset.top)
+
+
+for (ti in c(1:10)){
+  topGene <- subset.top$ensemblID[ti]
+  if (subset.top$hngc.symbol[ti] == "NA"){
+    topGeneName <- topGene
+  }else{
+    topGeneName <- subset.top$hngc.symbol[ti]
+  }
+  toppval <- subset.top$pvalue[ti]
+  topqval <- subset.top$padj[ti]
+  normCounts <- plotCounts(dds, gene = topGene, intgroup = c("Group"), returnData = TRUE)
+  normCounts$Gene <- topGene
+  normCounts$GeneName <- topGeneName
+  normCounts$pval <- toppval
+  normCounts$qval <- topqval
+  normCounts$title <- paste0(topGeneName, ", pval=", format(toppval, digits=3), ", qval=", format(topqval, digits=3) )
+  head(normCounts)
+  if (ti==1){
+    TopNormCounts <- normCounts
+  }else{
+    TopNormCounts <- rbind(TopNormCounts, normCounts)
+  }
+  
+}
+
+TopNormCounts$Group <- factor(TopNormCounts$Group, levels = c("Alliin/Placebo", "GRN/Alliin", 
+                                                              "GRN/Placebo", "Placebo/Placebo"))
+## The following plots all the genes into one figure
+pfig <- ggplot(TopNormCounts, aes(x = GeneName, y = count, fill = Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_log10() +
+  xlab("Gene Name") +
+  ylab("Normalised Gene Expression") +
+  ggtitle(gTitle)
+pfig
+
+```
+
+
+
+### Volcano Plot
+
+The following figures show the Volcano Plots for the tests on the effect of GRN and Alliin in each of the prostate zones. 
+
+
+```{r volcanoPlot.BC, eval=TRUE}
+
+p.adj.th <- 0.05
+fc.th <- 1
+
+# "BC.PZ" 
+tr <- "GRN"
+zone <- "PZ"
+res <- res.BC.PZ
+tr.name <- "glucoraphanin"
+
+print(paste0("Processing: ", tr, ", zone: ", zone))
+v.title <- "Volcano Plot"
+v.subtitle <- paste0(zone, ", " ,tr.name, ", p.val<= ", p.adj.th)
+
+
+## Volcano Plot ##
+# remove genes with NA pvalues
+keep <- !is.na(res$pvalue)
+resultsObject <- res[keep,]
+
+
+# Enhanced Volcano Plot
+EnhancedVolcano(resultsObject,
+                lab = resultsObject$hngc.symbol,
+                x = 'log2FoldChange',
+                y = 'pvalue',
+                pCutoff = p.adj.th,
+                FCcutoff = fc.th,
+                title = v.title,
+                subtitle = v.subtitle)
+    
+
+# "AD.PZ"
+tr <- "Alliin"
+zone <- "PZ"
+res <- res.AD.PZ
+tr.name <- "alliin"
+
+print(paste0("Processing: ", tr, ", zone: ", zone))
+v.title <- "Volcano Plot"
+v.subtitle <- paste0(zone, ", " ,tr.name, ", p.val<= ", p.adj.th)
+
+
+## Volcano Plot ##
+# remove genes with NA pvalues
+keep <- !is.na(res$pvalue)
+resultsObject <- res[keep,]
+
+# Enhanced Volcano Plot
+EnhancedVolcano(resultsObject,
+                lab = as.character(resultsObject$hngc.symbol),
+                x = 'log2FoldChange',
+                y = 'pvalue',
+                pCutoff = p.adj.th,
+                FCcutoff = fc.th,
+                title = v.title,
+                subtitle = v.subtitle)
+
+
+# "BC.TZ"
+tr <- "GRN"
+zone <- "TZ"
+res <- res.BC.TZ
+tr.name <- "glucoraphanin"
+
+print(paste0("Processing: ", tr, ", zone: ", zone))
+v.title <- "Volcano Plot"
+v.subtitle <- paste0(zone, ", " ,tr.name, ", p.val<= ", p.adj.th)
+
+
+## Volcano Plot ##
+# remove genes with NA pvalues
+keep <- !is.na(res$pvalue)
+resultsObject <- res[keep,]
+
+# Enhanced Volcano Plot
+EnhancedVolcano(resultsObject,
+                lab = as.character(resultsObject$hngc.symbol),
+                x = 'log2FoldChange',
+                y = 'pvalue',
+                pCutoff = p.adj.th,
+                FCcutoff = fc.th,
+                title = v.title,
+                subtitle = v.subtitle)
+
+
+# "AD.TZ"
+tr <- "Alliin"
+zone <- "TZ"
+res <- res.AD.TZ
+tr.name <- "alliin"
+
+print(paste0("Processing: ", tr, ", zone: ", zone))
+v.title <- "Volcano Plot"
+v.subtitle <- paste0(zone, ", " ,tr.name, ", p.val<= ", p.adj.th)
+
+
+## Volcano Plot ##
+# remove genes with NA pvalues
+keep <- !is.na(res$pvalue)
+resultsObject <- res[keep,]
+
+# Enhanced Volcano Plot
+EnhancedVolcano(resultsObject,
+                lab = as.character(resultsObject$hngc.symbol),
+                x = 'log2FoldChange',
+                y = 'pvalue',
+                pCutoff = p.adj.th,
+                FCcutoff = fc.th,
+                title = v.title,
+                subtitle = v.subtitle)
+
+
+```
+
+
+
+
+### Venn Diagrams
+
+
+```{r Venn.PZ, eval=TRUE}
+# Plot Venn Diagrams 
+
+## 1. Common genes between GRN and Alliin, PZ, adjusted p-value < 0.5
+venn_data <- data.frame( GRN.PZ.0.5 = res.BC.PZ$padj < 0.5,
+                         Alliin.PZ.0.5 = res.AD.PZ$padj < 0.5)
+vennDiagram(venn_data)
+n <- length(which(venn_data$GRN.PZ.0.5 == TRUE & venn_data$Alliin.PZ.0.5 == TRUE))
+print(paste0("Common genes between GRN and Alliin, PZ, p.val < 0.5 : ", n))
+
+
+
+## 2. Common genes between GRN and Allinn, TZ, adjusted p-value < 0.5
+venn_data <- data.frame( GRN.TZ.0.5 = res.BC.TZ$padj < 0.5,
+                         Alliin.TZ.0.5 = res.AD.TZ$padj < 0.5 )
+vennDiagram(venn_data)
+n <- length(which(venn_data$GRN.TZ.0.5 == TRUE & venn_data$Alliin.TZ.0.5 == TRUE))
+print(paste0("Common genes between GRN and Alliin, TZ, p.val < 0.5 : ", n))
+
+## Save Common genes between GRN and Allinn, TZ, adjusted p-value < 0.5 to file
+g <- res.BC.TZ[!is.na(res.BC.TZ$padj),]
+indx <- g$padj < 0.5
+GRN.df <- as.data.frame(g[indx,])
+
+g <- res.AD.TZ[!is.na(res.AD.TZ$padj),]
+indx <- g$padj < 0.5
+Alliin.df <- as.data.frame(g[indx,])
+
+CommonGenes <- inner_join(GRN.df, Alliin.df, by = c("ensemblID", "hngc.symbol", "baseMean", 
+                                                    "description", "entrez.desc", "name", "biotype"),
+                          suffix = c(".GRN", ".Alliin"))
+# Arrange column names
+CommonGenes <- CommonGenes[,c(7, 8, 1, 2, 13, 3, 14, 4, 15, 5, 16, 6, 17, 9:12)]
+# Order table by GRN adjusted p-value
+ComonGenesOrdered <- CommonGenes[order(CommonGenes$padj.GRN), ]
+# Show some of the common genes
+head(ComonGenesOrdered)
+
+if(saveFiles){
+  write.table(CommonGenes, paste0(DELOC, "common-genes-TZ.0.5.txt"), quote = FALSE, sep = "\t")
+}
+
+
+## 3. Common genes between GRN and Allinn, TZ, p.val < 0.1
+venn_data <- data.frame( GRN.TZ.0.1 = res.BC.TZ$padj < 0.1,
+                         Alliin.TZ.0.1 = res.AD.TZ$padj < 0.1 )
+vennDiagram(venn_data)
+n <- length(which(venn_data$GRN.TZ.0.1 == TRUE & venn_data$Alliin.TZ.0.1 == TRUE))
+print(paste0("Common genes between GRN and Alliin, TZ, p.val < 0.1 : ", n))
+
+```
+
+
+```{r packages}
+sessionInfo()
+```
+
